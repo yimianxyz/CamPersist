@@ -14,229 +14,69 @@ This directory contains documentation for the Xiaomi C700 camera setup installed
 ## Storage Solution
 
 The storage solution implements a multi-tier architecture:
-1. **Tier 1 (Cache)**: 256GB SD Card in camera
-2. **Tier 2 (Bridge)**: Debian server (archive.yimian.xyz) in the same LAN
-3. **Tier 3 (Long-term Storage)**: Aliyun OSS bucket (cam-archive) in Beijing Region (cn-beijing)
+
+1. **Tier 1 (Cache)**: 256GB SD Card in camera  
+2. **Tier 2 (Local Inbox + Bridge)**: Debian server (`archive.yimian.xyz`) in the same LAN, **with a local “inbox” directory for camera uploads**  
+3. **Tier 3 (Long-term Storage)**: Aliyun OSS bucket (`cam-archive`) in Beijing Region (`cn-beijing`) mounted via ossfs
+
+---
 
 ### Storage Flow
-1. Camera records events to SD card
-2. Camera connects to local Debian server via SMB v1
-3. Debian server mounts Aliyun OSS bucket using ossfs
-4. Videos are stored in Standard storage class (Local Redundancy Storage, LRS)
-5. After defined period, automatically transitioned to Deep Cold Archive storage class via lifecycle rules
+
+**Old Flow**: Camera wrote directly to `/mnt/oss` via Samba → this caused OSS GET/list requests during listings.  
+
+**New Flow** (cost-optimized, GET-free for writes):
+1. Camera writes new files via SMB to a **local ext4 inbox**: `/srv/camera_inbox`
+2. A cron job moves completed files (older than 5 minutes) from the inbox to the OSS mount `/mnt/oss/camera_videos`  
+3. OSS lifecycle rules move files to Deep Cold Archive after 30 days
+
+---
 
 ### Storage Requirements
 
-- **Daily Storage**: ~10GB per day
-- **Monthly Storage**: ~300GB per month
-- **Retention Period**: Indefinite (permanent storage)
+- **Daily Storage**: ~10GB/day
+- **Monthly Storage**: ~300GB/month
+- **Retention Period**: Indefinite
 - **Storage Classes**:
-  - **Initial Storage**: Standard Storage (¥0.12/GB/month)
-  - **Long-term Storage**: Deep Cold Archive (¥0.0075/GB/month)
-  - **Cost Optimization**: ~94% cost reduction after transition to Deep Cold Archive
+  - **Initial**: Standard Storage (¥0.12/GB/month)
+  - **Long-term**: Deep Cold Archive (¥0.0075/GB/month)
+  - **Cost Optimization**: ~94% reduction after transition
+
+---
 
 ### Directory Structure
-```
-/mnt/oss/
-└── camera_videos/      # Directory exposed to camera via SMB (write-only for camera)
+
 ```
 
+Local Inbox:
+/srv/camera\_inbox/
+└── XiaomiCamera\_00\_78DF72FFC6DD/
+
+OSS Mount:
+/mnt/oss/camera\_videos/
+└── XiaomiCamera\_00\_78DF72FFC6DD/
+
+````
+
+---
+
 ### Retention Strategy
+
 1. **Permission-Based Protection**:
-   - Create a dedicated SMB user for the camera
-   - Configure write-only permissions (no delete permissions)
-   - Camera can write new files but cannot delete existing ones
-   - Even with 30-day retention setting in camera, deletion attempts will fail
+   - Create a dedicated SMB user for the camera with write-only permissions (no deletes)
+   - Even with the 30-day retention setting in the camera, deletion attempts fail
 
 2. **SMB User Setup**:
 ```bash
-# Create dedicated user for camera
 sudo useradd -M -s /sbin/nologin xiaomi_cam
 sudo smbpasswd -a xiaomi_cam
-```
+````
 
-3. **SMB Configuration** (in `/etc/samba/smb.conf`):
-```ini
-[camera_videos]
-    path = /mnt/oss/camera_videos
-    valid users = xiaomi_cam
-    read only = no
-    create mask = 0644
-    directory mask = 0755
-    delete readonly = no
-    force user = xiaomi_cam
-```
+3. **Samba Configuration** (Docker)
 
-4. **Directory Permissions**:
-```bash
-# Set directory ownership and permissions
-sudo chown root:xiaomi_cam /mnt/oss/camera_videos
-sudo chmod 773 /mnt/oss/camera_videos
-```
+   * SMB share now points to **`/srv/camera_inbox`** instead of `/mnt/oss/camera_videos`
+   * Write-only semantics (no read access to prevent browsing)
 
-### Camera-Side Configuration:
-- Configure NAS storage in Xiaomi Home APP
-- Set retention to 30 days (deletion will be prevented by permissions)
-- Use the following credentials:
-  - Username: xiaomi_cam
-  - Password: [as set by smbpasswd]
-  - Share path: \\archive.yimian.xyz\camera_videos
-
-### Storage Cost Estimation
-- **First Month (Standard Storage)**: 300GB × ¥0.12 = ¥36/month
-- **Long-term Monthly (Deep Cold Archive)**: 300GB × ¥0.0075 = ¥2.25/month
-- **Yearly Accumulation**: ~3.6TB
-- **Example Annual Cost After 1 Year**:
-  - Recent month in Standard: 300GB × ¥0.12 = ¥36
-  - Previous 11 months in Deep Cold Archive: 3.3TB × ¥0.0075 = ¥24.75
-  - Total: ~¥60.75/month
-
-### OSS Bucket Configuration
-- **Bucket Name**: cam-archive
-- **Region**: China North 2 (Beijing)
-- **Storage Class**: Standard Storage
-- **Redundancy Type**: Locally Redundant Storage (LRS)
-- **Access Control**: Private
-- **Endpoint**: 
-  - Internal: `oss-cn-beijing-internal.aliyuncs.com`
-  - External: `oss-cn-beijing.aliyuncs.com`
-
-## Implementation
-
-### Prerequisites
-
-1. Xiaomi C700 camera with 256GB SD card
-2. Debian server (archive.yimian.xyz) in the same LAN
-3. Aliyun OSS bucket
-4. Aliyun OSS access credentials
-5. FUSE 2.8.4+ installed on Debian server
-
-### Setup Steps
-
-1. **Aliyun OSS Setup**
-   - Create OSS bucket
-   - Generate access credentials
-   - Install ossfs on Debian server
-   - Configure ossfs mount point
-   - Configure lifecycle rules for transition to Deep Cold Archive
-
-2. **Debian Server Setup**
-   - Install Samba server
-   - Create xiaomi_cam user
-   - Configure SMB share with write-only permissions
-   - Mount OSS bucket to shared directory using ossfs
-   - Set appropriate directory permissions
-
-3. **Camera Setup**
-   - Configure NAS storage in Xiaomi Home APP
-   - Use provided xiaomi_cam credentials
-   - Test write access
-
-### Configuration
-
-#### Required Credentials
-Before proceeding with ossfs installation, gather the following information:
-1. **OSS Access Credentials**:
-   - Access Key ID from Aliyun console
-   - Access Key Secret from Aliyun console
-2. **Bucket Information** (already configured):
-   - Bucket Name: `cam-archive`
-   - Region: `cn-beijing`
-   - Internal Endpoint: `oss-cn-beijing-internal.aliyuncs.com`
-
-#### OSS Lifecycle Rules
-```
-Rule 1: Transition to Deep Cold Archive
-- Prefix: videos/
-- Days after object creation: 30
-- Transition to: Deep Cold Archive Storage
-```
-
-#### ossfs Configuration
-> Reference: 
-> - [Installing ossfs](https://help.aliyun.com/zh/oss/developer-reference/installing-ossfs?spm=a2c4g.11186623.0.0.5e923c93kOrtmU)
-> - [Advanced Configuration](https://help.aliyun.com/zh/oss/developer-reference/advanced-configurations?spm=a2c4g.11186623.0.0.8cfd81c1FPSxcd)
-
-**Storage Behavior**:
-- Files in `/mnt/oss` are virtual representations of OSS objects
-- No significant local disk space is used on the CentOS server
-- Only metadata and temporary transfer buffers are stored locally
-- Actual video data is stored directly in Aliyun OSS
-- Server acts as a pass-through for data between camera and OSS
-
-```bash
-# 1. Install ossfs
-## First install FUSE
-sudo yum install fuse fuse-devel
-
-## Check FUSE version (requirement: >= 2.8.4)
-fusermount -V
-
-## Install ossfs for CentOS 7
-sudo wget https://gosspublic.alicdn.com/ossfs/ossfs_1.91.4_centos7.0_x86_64.rpm
-sudo yum install ossfs_1.91.4_centos7.0_x86_64.rpm
-
-## Install mime support (required for proper Content-Type setting)
-sudo yum install mailcap
-
-# 2. Verify installation
-ossfs --version
-
-# 3. Configure credentials
-## Save account information to /etc/passwd-ossfs and set permissions to 640
-echo "cam-archive:$ACCESS_KEY_ID:$ACCESS_KEY_SECRET"  | sudo tee /etc/passwd-ossfs
-
-# 4. Create mount point
-sudo mkdir -p /mnt/oss
-
-# 5. Mount OSS bucket
-## Using debug mode for initial testing
-sudo ln -s /usr/local/bin/ossfs /usr/bin/ossfs
-sudo ossfs cam-archive /mnt/oss \
-    -ourl=https://oss-cn-beijing.aliyuncs.com \
-    -oallow_other
-
-# 6. Once testing is successful, add to /etc/fstab for auto-mount on boot (CentOS 7.0+)
-
-## First create the auto-mount script
-sudo vim /etc/init.d/ossfs
-# Add the following content (modify paths as needed):
-########################### File content ###########################
-
-#! /bin/bash
-#
-# ossfs      Automount Aliyun OSS Bucket in the specified direcotry.
-#
-# chkconfig: 2345 90 10
-# description: Activates/Deactivates ossfs configured to start at boot time.
-
-ossfs cam-archive /mnt/oss -ourl=https://oss-cn-beijing.aliyuncs.com -oallow_other
-
-
-########################## End of file content ###########################
-
-## Make the script executable
-sudo chmod a+x /etc/init.d/ossfs
-
-## Enable the service
-sudo chkconfig ossfs on
-
-# 7. Verify mount
-df -h
-ls /mnt/oss
-# 8. To unmount if needed
-sudo umount /mnt/oss
-```
-
-#### Samba Configuration (Docker)
-> Note: Using existing dperson/samba Docker container in docker-compose.yml
-
-1. **First mount OSS on host**:
-```bash
-# Follow the ossfs configuration steps above to mount OSS at /mnt/oss
-```
-
-2. **Update docker-compose.yml Samba service**:
 ```yaml
   samba:
     container_name: samba
@@ -245,107 +85,121 @@ sudo umount /mnt/oss
     ports:
       - "139:139/tcp"
       - "445:445/tcp"
-      - "137:137/udp"   # Add NetBIOS name service
-      - "138:138/udp"   # Add NetBIOS datagram service
+      - "137:137/udp"
+      - "138:138/udp"
     tmpfs:
       - /tmp
     restart: unless-stopped
     volumes:
-      - "/home/iotcat/data/nextcloud/data/xiuju/files/家庭共享:/mount"
-      - "/mnt/oss/camera_videos:/camera:rw"
+      - "/srv/camera_inbox:/camera:rw"
     command: >-
-      -u "iotcat;123" 
-      -s "camera_videos;/camera;yes;no;no;all;none" 
-      -w "WORKGROUP" 
+      -u "xiaomi_cam;PASSWORD"
+      -s "camera_videos;/camera;yes;no;no;all;none"
+      -w "WORKGROUP"
       -n
       -S
 ```
 
-3. **Directory Permissions on Host**:
+4. **Local Inbox Permissions**:
+
 ```bash
-# Set permissions on host directory
-sudo mkdir -p /mnt/oss/camera_videos
-sudo chown 1000:1000 /mnt/oss/camera_videos
-sudo chmod 773 /mnt/oss/camera_videos
+sudo mkdir -p /srv/camera_inbox
+sudo chown 1000:1000 /srv/camera_inbox
+sudo chmod 773 /srv/camera_inbox
 ```
 
-4. **Apply Changes**:
-```bash
-# Restart the Samba container
-docker-compose restart samba
+---
 
-# Test connection
-smbclient //archive.yimian.xyz/camera_videos -U iotcat
+### Camera-Side Configuration
+
+* In Xiaomi Home APP:
+
+  * Configure NAS storage
+  * Set retention to 30 days (deletion prevented by permissions)
+  * SMB credentials:
+
+    * Username: `xiaomi_cam`
+    * Password: **\[as set above]**
+    * Share path: `\\archive.yimian.xyz\camera_videos`
+
+---
+
+## OSS Mount (unchanged from before)
+
+* **Bucket Name**: cam-archive
+* **Region**: cn-beijing
+* **Mount Point**: `/mnt/oss`
+* **Subfolder for videos**: `/mnt/oss/camera_videos`
+* **Lifecycle**: Transition to Deep Cold Archive after 30 days
+
+---
+
+## Cron-based Mover Script
+
+**Purpose**:
+Avoid any OSS reads by letting the camera write locally, then pushing files to OSS in the background.
+
+**Script Path**: `/home/iotcat/config/cron/camera_mover.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+INBOX="/srv/camera_inbox"
+DEST="/mnt/oss/camera_videos"
+
+cd "$INBOX"
+find . -type f -mmin +5 -print0 | while IFS= read -r -d '' f; do
+  mv -f -- "$f" "$DEST/$f" 2>/dev/null || \
+    echo "$(date -Is) failed to move $f (dest folder missing)" >&2
+done
 ```
 
-**Additional Network Configuration**:
-1. **DNS Entry** (if you have control over local DNS):
+**Install Script**:
+
 ```bash
-# Add to your DNS server or local hosts file
-archive.yimian.xyz  192.168.x.x  # Replace with actual IP
-ARCHIVENAS         192.168.x.x  # Replace with actual IP
+sudo mkdir -p /home/iotcat/config/cron
+sudo tee /home/iotcat/config/cron/camera_mover.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+INBOX="/srv/camera_inbox"
+DEST="/mnt/oss/camera_videos"
+cd "$INBOX"
+find . -type f -mmin +5 -print0 | while IFS= read -r -d '' f; do
+  mv -f -- "$f" "$DEST/$f" 2>/dev/null || \
+    echo "$(date -Is) failed to move $f (dest folder missing)" >&2
+done
+EOF
+sudo chmod +x /home/iotcat/config/cron/camera_mover.sh
 ```
 
-2. **Network Discovery Tips**:
-- The camera should now be able to find the server as "ARCHIVENAS" in the network
-- Try both server names when configuring the camera:
-  1. ARCHIVENAS
-  2. archive.yimian.xyz
-  3. \\ARCHIVENAS\camera_videos
-  4. \\archive.yimian.xyz\camera_videos
+**Set up Cron**:
 
-3. **Troubleshooting Network Discovery**:
 ```bash
-# Check if NetBIOS name is broadcast correctly
-nmblookup ARCHIVENAS
-
-# Check network visibility
-smbclient -L ARCHIVENAS -N
-
-# Test connection with NetBIOS name
-smbclient //ARCHIVENAS/camera_videos -U iotcat
+sudo crontab -e
 ```
 
-### Camera-Side Configuration:
-- Configure NAS storage in Xiaomi Home APP
-- Set retention to 30 days (deletion will be prevented by permissions)
-- Use the following credentials:
-  - Username: xiaomi_cam
-  - Password: [as set in docker-compose]
-  - Share path: \\archive.yimian.xyz\camera_videos
+Add:
 
-**Note**: The changes above:
-1. Add a new mount point for the OSS camera directory
-2. Create a dedicated xiaomi_cam user
-3. Add SMB1 protocol support required by the camera
-4. Keep existing nextcloud share intact
-5. Use the same container and network setup as your current configuration
+```
+*/5 * * * * /home/iotcat/config/cron/camera_mover.sh
+```
+
+---
+
+## Why This Works
+
+* **No OSS GET/list operations from the camera** — it only touches the local inbox.
+* **OSS writes only happen from the cron mover**, which never lists or browses the mount, only writes files.
+* **Subfolder structure is preserved** (camera’s unique naming ensures no collisions).
+* Minimal OSS operations = lower cost.
+
+---
 
 ## Monitoring and Maintenance
 
-- Monitor available space on SD card
-- Monitor ossfs mount status
-- Monitor Aliyun OSS usage and costs
-- Regular backup verification
-- Track storage class transitions
-- Monitor lifecycle rule execution
-- Verify SMB permissions are maintained
-- Monitor failed deletion attempts in Samba logs
+* Check free space in `/srv/camera_inbox`
+* Ensure cron job runs (`grep CRON /var/log/syslog` or `journalctl -u cron`)
+* Monitor OSS usage and lifecycle transitions
+* Check Samba logs for failed writes
 
-## Troubleshooting
-
-Common issues:
-- ossfs connection drops
-- SMB connection issues
-- Storage capacity issues
-- Network bandwidth constraints
-- Storage class transition delays
-- Deep Cold Archive retrieval times (12/48 hours)
-
-## Future Improvements
-
-- Implement monitoring and alerting system
-- Optimize storage transition periods
-- Consider implementing backup solution
-- Add data retrieval automation tools
-- Implement video indexing and search capabilities
